@@ -13,10 +13,50 @@ const wss = new WebSocket.Server({ server });
 
 // ============== CONFIGURAÇÃO ==============
 const TMDB_API_KEY = "b095ccbbb185d27703d007ae0ded5f7d";
+const TWITCH_CLIENT_ID = "sah4oubx3irkbvh6m4jf28s2mefx46";
+const TWITCH_CLIENT_SECRET = "k271wxor46h79d66wohz47v85mxdhg";
 const PORT = process.env.PORT || 3000;
 // ==========================================
 
-let currentMovie = null; // { title, poster, ratings: [] }
+let currentMovie = null;
+let twitchToken = null;
+let tokenExpires = 0;
+
+// ---------- Twitch Token ----------
+async function getTwitchToken() {
+  if (twitchToken && Date.now() < tokenExpires) return twitchToken;
+
+  const res = await fetch("https://id.twitch.tv/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`
+  });
+
+  const data = await res.json();
+  twitchToken = data.access_token;
+  tokenExpires = Date.now() + (data.expires_in - 60) * 1000;
+  return twitchToken;
+}
+
+// ---------- Buscar avatar Twitch ----------
+async function getTwitchAvatar(username) {
+  try {
+    const token = await getTwitchToken();
+    const res = await fetch(`https://api.twitch.tv/helix/users?login=${username}`, {
+      headers: {
+        "Client-ID": TWITCH_CLIENT_ID,
+        "Authorization": `Bearer ${token}`
+      }
+    });
+    const data = await res.json();
+    if (data.data && data.data[0]) {
+      return data.data[0].profile_image_url;
+    }
+  } catch (err) {
+    console.error("Erro ao buscar avatar:", err.message);
+  }
+  return null;
+}
 
 // ---------- TMDB ----------
 async function searchMovie(title) {
@@ -30,9 +70,7 @@ async function searchMovie(title) {
       return {
         title: movie.title || title,
         original_title: movie.original_title,
-        poster: movie.poster_path
-          ? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
-          : null,
+        poster: movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : null,
         year: movie.release_date ? movie.release_date.substring(0, 4) : null
       };
     }
@@ -42,7 +80,7 @@ async function searchMovie(title) {
   return { title, poster: null, year: null };
 }
 
-// ---------- WebSocket (overlay) ----------
+// ---------- WebSocket ----------
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach((client) => {
@@ -55,39 +93,39 @@ function broadcast(data) {
 wss.on("connection", (ws) => {
   console.log("Overlay conectado");
 
-  // Manda o estado atual assim que conecta
   if (currentMovie) {
     ws.send(JSON.stringify({ type: "state", movie: currentMovie }));
   }
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     try {
       const data = JSON.parse(raw);
 
-      // Overlay mandando uma nota
       if (data.type === "rating" && currentMovie) {
-        const { username, displayName, avatar, score, platform } = data;
+        const { username, displayName, score, platform } = data;
 
-        // Evita nota duplicada do mesmo usuário
+        // Evita nota duplicada
         const already = currentMovie.ratings.find(
           (r) => r.username.toLowerCase() === username.toLowerCase()
         );
         if (already) return;
 
+        // Busca avatar real
+        const avatar = await getTwitchAvatar(username);
+
         currentMovie.ratings.push({
           username,
           displayName: displayName || username,
-          avatar: avatar || null,
+          avatar: avatar,
           score: Number(score),
           platform: platform || "twitch",
           time: Date.now()
         });
 
-        // Ordena por nota (maior primeiro)
         currentMovie.ratings.sort((a, b) => b.score - a.score);
 
         broadcast({ type: "state", movie: currentMovie });
-        console.log(`Nota recebida: ${displayName} → ${score}`);
+        console.log(`Nota: ${displayName} → ${score}`);
       }
     } catch (e) {
       console.error("Erro WS:", e.message);
@@ -114,7 +152,6 @@ app.post("/movie-ended", async (req, res) => {
   };
 
   broadcast({ type: "movie-started", movie: currentMovie });
-
   res.json({ ok: true, movie: currentMovie });
 });
 
@@ -128,7 +165,6 @@ app.post("/reset", (req, res) => {
   res.json({ ok: true });
 });
 
-// Health check (Render gosta)
 app.get("/", (req, res) => {
   res.send("Movie Rating Backend online");
 });
