@@ -21,6 +21,8 @@ const PORT = process.env.PORT || 3000;
 let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
+// Impede votos duplicados quando o mesmo comando chega quase simultaneamente.
+const pendingRatings = new Set();
 
 // ---------- Twitch ----------
 async function getTwitchToken() {
@@ -88,26 +90,45 @@ wss.on("connection", (ws) => {
   if (currentMovie) ws.send(JSON.stringify({ type: "state", movie: currentMovie }));
 
   ws.on("message", async (raw) => {
+    let ratingKey = null;
     try {
       const data = JSON.parse(raw);
-      if (data.type === "rating" && currentMovie) {
-        const username = data.username;
-        const displayName = data.displayName;
-        const score = data.score;
-        if (currentMovie.ratings.some(r => r.username.toLowerCase() === username.toLowerCase())) return;
+      if (data.type !== "rating" || !currentMovie) return;
 
-        const avatar = await getTwitchAvatar(username);
-        currentMovie.ratings.push({
-          username,
-          displayName: displayName || username,
-          avatar,
-          score: Number(score),
-          time: Date.now()
-        });
-        currentMovie.ratings.sort((a, b) => b.score - a.score);
-        broadcast({ type: "state", movie: currentMovie });
-      }
-    } catch (e) {}
+      const movieAtReceipt = currentMovie;
+      const username = String(data.username || "").trim();
+      const normalizedUsername = username.toLowerCase();
+      const score = Number(data.score);
+      if (!normalizedUsername || !Number.isFinite(score)) return;
+
+      // Inclui a sessão do filme: a mesma pessoa pode votar no próximo título.
+      ratingKey = String(movieAtReceipt.startedAt) + ":" + normalizedUsername;
+      const alreadyRated = movieAtReceipt.ratings.some(
+        r => String(r.username || "").trim().toLowerCase() === normalizedUsername
+      );
+      if (alreadyRated || pendingRatings.has(ratingKey)) return;
+
+      // Reserva antes de buscar o avatar (operação assíncrona).
+      pendingRatings.add(ratingKey);
+      const avatar = await getTwitchAvatar(username);
+
+      // Não transfere voto atrasado para um filme que começou depois.
+      if (currentMovie !== movieAtReceipt) return;
+
+      movieAtReceipt.ratings.push({
+        username,
+        displayName: String(data.displayName || username),
+        avatar,
+        score,
+        time: Date.now()
+      });
+      movieAtReceipt.ratings.sort((a, b) => b.score - a.score);
+      broadcast({ type: "state", movie: movieAtReceipt });
+    } catch (e) {
+      console.error("Erro ao processar voto:", e.message);
+    } finally {
+      if (ratingKey) pendingRatings.delete(ratingKey);
+    }
   });
 });
 
