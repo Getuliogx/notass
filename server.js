@@ -15,30 +15,42 @@ const wss = new WebSocket.Server({ server });
 const TMDB_API_KEY = "b095ccbbb185d27703d007ae0ded5f7d";
 const TWITCH_CLIENT_ID = "sah4oubx3irkbvh6m4jf28s2mefx46";
 const TWITCH_CLIENT_SECRET = "k271wxor46h79d66wohz47v85mxdhg";
+
+const CINEFY_CHANNEL_ID = "d81e634a-3ab1-4217-bf35-94e8d3c5250a";
+const CINEFY_PUSHER_URL = "wss://ws-sa1.pusher.com/app/69544a8f3c11bd825651?protocol=7&client=js&version=8.4.0&flash=false";
+
 const PORT = process.env.PORT || 3000;
 // ====================================
 
 let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
+let cinefyWs = null;
+let cinefyReconnectTimer = null;
 
-// ---------- Twitch ----------
+// ---------- Twitch Avatar ----------
 async function getTwitchToken() {
   if (twitchToken && Date.now() < tokenExpires) return twitchToken;
-  const res = await fetch("https://id.twitch.tv/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: "client_id=" + TWITCH_CLIENT_ID + "&client_secret=" + TWITCH_CLIENT_SECRET + "&grant_type=client_credentials"
-  });
-  const data = await res.json();
-  twitchToken = data.access_token;
-  tokenExpires = Date.now() + (data.expires_in - 60) * 1000;
-  return twitchToken;
+  try {
+    const res = await fetch("https://id.twitch.tv/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "client_id=" + TWITCH_CLIENT_ID + "&client_secret=" + TWITCH_CLIENT_SECRET + "&grant_type=client_credentials"
+    });
+    const data = await res.json();
+    twitchToken = data.access_token;
+    tokenExpires = Date.now() + (data.expires_in - 60) * 1000;
+    return twitchToken;
+  } catch (e) {
+    console.error("Twitch token error:", e.message);
+    return null;
+  }
 }
 
 async function getTwitchAvatar(username) {
   try {
     const token = await getTwitchToken();
+    if (!token) return null;
     const res = await fetch("https://api.twitch.tv/helix/users?login=" + username, {
       headers: {
         "Client-ID": TWITCH_CLIENT_ID,
@@ -73,10 +85,10 @@ async function searchMovie(title) {
   } catch (err) {
     console.error("TMDB error:", err.message);
   }
-  return { title, year: null, poster: null };
+  return { title: title, year: null, poster: null };
 }
 
-// ---------- WebSocket ----------
+// ---------- WebSocket (Overlay) ----------
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => {
@@ -84,38 +96,132 @@ function broadcast(data) {
   });
 }
 
+function addRating(username, displayName, score, avatar, platform) {
+  if (!currentMovie) return false;
+  if (currentMovie.ratings.some(r => r.username.toLowerCase() === username.toLowerCase())) return false;
+
+  currentMovie.ratings.push({
+    username,
+    displayName: displayName || username,
+    avatar: avatar || null,
+    score: Number(score),
+    platform: platform || "unknown",
+    time: Date.now()
+  });
+
+  currentMovie.ratings.sort((a, b) => b.score - a.score);
+  broadcast({ type: "state", movie: currentMovie });
+  console.log("[" + platform + "] Nota: " + displayName + " → " + score);
+  return true;
+}
+
 wss.on("connection", (ws) => {
+  console.log("Overlay conectado");
   if (currentMovie) ws.send(JSON.stringify({ type: "state", movie: currentMovie }));
 
   ws.on("message", async (raw) => {
     try {
       const data = JSON.parse(raw);
       if (data.type === "rating" && currentMovie) {
-        const username = data.username;
-        const displayName = data.displayName;
-        const score = data.score;
-        if (currentMovie.ratings.some(r => r.username.toLowerCase() === username.toLowerCase())) return;
-
-        const avatar = await getTwitchAvatar(username);
-        currentMovie.ratings.push({
-          username,
-          displayName: displayName || username,
-          avatar,
-          score: Number(score),
-          time: Date.now()
-        });
-        currentMovie.ratings.sort((a, b) => b.score - a.score);
-        broadcast({ type: "state", movie: currentMovie });
+        const avatar = data.avatar || await getTwitchAvatar(data.username);
+        addRating(data.username, data.displayName, data.score, avatar, data.platform || "twitch");
       }
     } catch (e) {}
   });
 });
+
+// ---------- CINEFY CONNECTION ----------
+function connectCinefy() {
+  if (cinefyWs) {
+    try { cinefyWs.terminate(); } catch (e) {}
+  }
+
+  console.log("[Cinefy] Conectando...");
+  cinefyWs = new WebSocket(CINEFY_PUSHER_URL);
+
+  cinefyWs.on("open", () => {
+    console.log("[Cinefy] Conectado ao Pusher");
+    // Subscribe
+    cinefyWs.send(JSON.stringify({
+      event: "pusher:subscribe",
+      data: { channel: "chatroom." + CINEFY_CHANNEL_ID }
+    }));
+  });
+
+  cinefyWs.on("message", (raw) => {
+    try {
+      const payload = JSON.parse(raw.toString());
+
+      // Mensagens de chat da Cinefy
+      if (payload.event === "App\\Events\\ChatMessageEvent" || 
+          payload.event === "client-chat-message" ||
+          (payload.event && payload.event.includes("ChatMessage"))) {
+        
+        let data = payload.data;
+        if (typeof data === "string") {
+          try { data = JSON.parse(data); } catch (e) { return; }
+        }
+
+        handleCinefyMessage(data);
+      }
+    } catch (e) {}
+  });
+
+  cinefyWs.on("close", () => {
+    console.log("[Cinefy] Desconectado. Reconectando em 5s...");
+    cinefyReconnectTimer = setTimeout(connectCinefy, 5000);
+  });
+
+  cinefyWs.on("error", (err) => {
+    console.error("[Cinefy] Erro:", err.message);
+  });
+}
+
+function handleCinefyMessage(data) {
+  if (!currentMovie) return;
+
+  // Extrai texto e usuário de vários formatos possíveis
+  const text = (data.content || data.message || data.text || "").trim().toLowerCase();
+  
+  let username = "";
+  let displayName = "";
+  let avatar = null;
+
+  if (data.sender) {
+    username = (data.sender.username || data.sender.slug || data.sender.name || "").toLowerCase();
+    displayName = data.sender.username || data.sender.name || username;
+    avatar = data.sender.profile_pic || data.sender.profile_picture || data.sender.avatar || null;
+  } else if (data.user) {
+    username = (data.user.username || data.user.slug || data.user.name || "").toLowerCase();
+    displayName = data.user.username || data.user.name || username;
+    avatar = data.user.profile_pic || data.user.profile_picture || data.user.avatar || null;
+  } else {
+    username = (data.username || data.user_name || "").toLowerCase();
+    displayName = data.username || data.user_name || username;
+  }
+
+  if (!text || !username) return;
+
+  // Parse da nota
+  let score = null;
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    score = parseFloat(text);
+  } else {
+    const match = text.match(/^!(?:nota|n)\s*(\d+(?:\.\d+)?)$/i);
+    if (match) score = parseFloat(match[1]);
+  }
+
+  if (score === null || score < 0 || score > 10) return;
+
+  addRating(username, displayName, score, avatar, "cinefy");
+}
 
 // ---------- Rotas ----------
 app.post("/movie-ended", async (req, res) => {
   const title = req.body.title;
   if (!title) return res.status(400).json({ error: "title obrigatório" });
 
+  console.log("Filme finalizado:", title);
   const tmdb = await searchMovie(title);
 
   currentMovie = {
@@ -138,9 +244,9 @@ app.post("/reset", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/", (req, res) => res.send("Movie Rating Backend online"));
+app.get("/", (req, res) => res.send("Movie Rating Backend online + Cinefy"));
 
-// ---------- Search ----------
+// ---------- Search + Painel ----------
 app.get("/search", async (req, res) => {
   const q = req.query.q;
   const type = req.query.type || "movie";
@@ -167,7 +273,6 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ---------- Painel ----------
 app.get("/painel", (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
@@ -225,8 +330,9 @@ app.get("/painel", (req, res) => {
       <p>Pesquise, salve e atualize o "Assistindo Agora".</p>
     </div>
     <div class="badges">
-      <div class="badge"><div class="dot"></div> TMDB conectado</div>
-      <div class="badge"><div class="dot"></div> Overlay conectada</div>
+      <div class="badge"><div class="dot"></div> TMDB</div>
+      <div class="badge"><div class="dot"></div> Cinefy</div>
+      <div class="badge"><div class="dot"></div> Overlay</div>
     </div>
   </div>
 
@@ -293,8 +399,8 @@ app.get("/painel", (req, res) => {
             '<div class="title">' + item.title + '</div>' +
             '<div class="meta">' + (item.type === "tv" ? "Série" : "Filme") + (item.year ? " • " + item.year : "") + '</div>' +
             '<div class="actions">' +
-              '<button class="btn btn-primary btn-sm" onclick=\\'activate(' + JSON.stringify(item) + ')\\'>Atualizar overlay</button>' +
-              '<button class="btn btn-outline btn-sm" onclick=\\'saveItem(' + JSON.stringify(item) + ')\\'>Salvar</button>' +
+              "<button class=\\"btn btn-primary btn-sm\\" onclick='activate(" + JSON.stringify(item) + ")'>Atualizar overlay</button>" +
+              "<button class=\\"btn btn-outline btn-sm\\" onclick='saveItem(" + JSON.stringify(item) + ")'>Salvar</button>" +
             '</div>' +
           '</div>' +
         '</div>';
@@ -337,7 +443,7 @@ app.get("/painel", (req, res) => {
             '<div class="title">' + item.title + '</div>' +
             '<div class="meta">' + (item.type === "tv" ? "Série" : "Filme") + (item.year ? " • " + item.year : "") + '</div>' +
           '</div>' +
-          '<button class="btn btn-primary btn-sm" onclick=\\'activate(' + JSON.stringify(item) + ')\\'>Usar</button>' +
+          "<button class=\\"btn btn-primary btn-sm\\" onclick='activate(" + JSON.stringify(item) + ")'>Usar</button>" +
           '<button class="btn btn-outline btn-sm" onclick="removeSaved(' + i + ')">✕</button>' +
         '</div>';
       }).join("") || "<div class='empty'>Nenhum título salvo.</div>";
@@ -374,4 +480,8 @@ app.get("/painel", (req, res) => {
 </html>`);
 });
 
-server.listen(PORT, () => console.log("Backend online na porta", PORT));
+// Inicia o servidor e a conexão Cinefy
+server.listen(PORT, () => {
+  console.log("Backend online na porta", PORT);
+  connectCinefy();
+});
