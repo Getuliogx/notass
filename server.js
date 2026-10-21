@@ -21,8 +21,6 @@ const PORT = process.env.PORT || 3000;
 let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
-// Impede votos duplicados quando o mesmo comando chega quase simultaneamente.
-const pendingRatings = new Set();
 
 // ---------- Twitch ----------
 async function getTwitchToken() {
@@ -90,70 +88,40 @@ wss.on("connection", (ws) => {
   if (currentMovie) ws.send(JSON.stringify({ type: "state", movie: currentMovie }));
 
   ws.on("message", async (raw) => {
-    let ratingKey = null;
     try {
       const data = JSON.parse(raw);
-      if (data.type !== "rating" || !currentMovie) return;
+      if (data.type === "rating" && currentMovie) {
+        const username = data.username;
+        const displayName = data.displayName;
+        const score = data.score;
+        if (currentMovie.ratings.some(r => r.username.toLowerCase() === username.toLowerCase())) return;
 
-      const movieAtReceipt = currentMovie;
-      const username = String(data.username || "").trim();
-      const normalizedUsername = username.toLowerCase();
-      const score = Number(data.score);
-      if (!normalizedUsername || !Number.isFinite(score)) return;
-
-      // Inclui a sessão do filme: a mesma pessoa pode votar no próximo título.
-      ratingKey = String(movieAtReceipt.startedAt) + ":" + normalizedUsername;
-      const alreadyRated = movieAtReceipt.ratings.some(
-        r => String(r.username || "").trim().toLowerCase() === normalizedUsername
-      );
-      if (alreadyRated || pendingRatings.has(ratingKey)) return;
-
-      // Reserva antes de buscar o avatar (operação assíncrona).
-      pendingRatings.add(ratingKey);
-      const avatar = await getTwitchAvatar(username);
-
-      // Não transfere voto atrasado para um filme que começou depois.
-      if (currentMovie !== movieAtReceipt) return;
-
-      movieAtReceipt.ratings.push({
-        username,
-        displayName: String(data.displayName || username),
-        avatar,
-        score,
-        time: Date.now()
-      });
-      movieAtReceipt.ratings.sort((a, b) => b.score - a.score);
-      broadcast({ type: "state", movie: movieAtReceipt });
-    } catch (e) {
-      console.error("Erro ao processar voto:", e.message);
-    } finally {
-      if (ratingKey) pendingRatings.delete(ratingKey);
-    }
+        const avatar = await getTwitchAvatar(username);
+        currentMovie.ratings.push({
+          username,
+          displayName: displayName || username,
+          avatar,
+          score: Number(score),
+          time: Date.now()
+        });
+        currentMovie.ratings.sort((a, b) => b.score - a.score);
+        broadcast({ type: "state", movie: currentMovie });
+      }
+    } catch (e) {}
   });
 });
 
 // ---------- Rotas ----------
 app.post("/movie-ended", async (req, res) => {
-  const title = String(req.body.title || "").trim();
+  const title = req.body.title;
   if (!title) return res.status(400).json({ error: "title obrigatório" });
 
-  // Quando o painel envia um resultado selecionado, reutiliza exatamente
-  // os dados desse cartão para manter título, ano e capa iguais no overlay.
-  let movieData;
-  if (req.body.poster !== undefined || req.body.type !== undefined) {
-    movieData = {
-      title: title.replace(/\\s*\\(\\d{4}\\)\\s*$/, "").trim(),
-      year: req.body.year ? String(req.body.year) : (title.match(/\\((\\d{4})\\)\\s*$/) || [])[1] || null,
-      poster: typeof req.body.poster === "string" && req.body.poster ? req.body.poster : null
-    };
-  } else {
-    movieData = await searchMovie(title);
-  }
+  const tmdb = await searchMovie(title);
 
   currentMovie = {
-    title: movieData.title,
-    year: movieData.year,
-    poster: movieData.poster,
+    title: tmdb.title,
+    year: tmdb.year,
+    poster: tmdb.poster,
     ratings: [],
     startedAt: Date.now()
   };
@@ -339,7 +307,7 @@ app.get("/painel", (req, res) => {
       const res = await fetch("/movie-ended", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title, year: item.year, poster: item.poster, type: item.type })
+        body: JSON.stringify({ title: title })
       });
       if (res.ok) {
         showStatus("✓ Overlay atualizada: " + item.title);
