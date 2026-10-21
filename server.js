@@ -134,15 +134,26 @@ wss.on("connection", (ws) => {
 
 // ---------- Rotas ----------
 app.post("/movie-ended", async (req, res) => {
-  const title = req.body.title;
+  const title = String(req.body.title || "").trim();
   if (!title) return res.status(400).json({ error: "title obrigatório" });
 
-  const tmdb = await searchMovie(title);
+  // Quando o painel envia um resultado selecionado, reutiliza exatamente
+  // os dados desse cartão para manter título, ano e capa iguais no overlay.
+  let movieData;
+  if (req.body.poster !== undefined || req.body.type !== undefined) {
+    movieData = {
+      title: title.replace(/\\s*\\(\\d{4}\\)\\s*$/, "").trim(),
+      year: req.body.year ? String(req.body.year) : (title.match(/\\((\\d{4})\\)\\s*$/) || [])[1] || null,
+      poster: typeof req.body.poster === "string" && req.body.poster ? req.body.poster : null
+    };
+  } else {
+    movieData = await searchMovie(title);
+  }
 
   currentMovie = {
-    title: tmdb.title,
-    year: tmdb.year,
-    poster: tmdb.poster,
+    title: movieData.title,
+    year: movieData.year,
+    poster: movieData.poster,
     ratings: [],
     startedAt: Date.now()
   };
@@ -328,7 +339,7 @@ app.get("/painel", (req, res) => {
       const res = await fetch("/movie-ended", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title })
+        body: JSON.stringify({ title: title, year: item.year, poster: item.poster, type: item.type })
       });
       if (res.ok) {
         showStatus("✓ Overlay atualizada: " + item.title);
