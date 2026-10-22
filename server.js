@@ -16,12 +16,19 @@ const TWITCH_CLIENT_ID = "sah4oubx3irkbvh6m4jf28s2mefx46";
 const TWITCH_CLIENT_SECRET = "k271wxor46h79d66wohz47v85mxdhg";
 const CINEFY_CHANNEL_ID = "d81e634a-3ab1-4217-bf35-94e8d3c5250a";
 const CINEFY_PUSHER_URL = "wss://ws-sa1.pusher.com/app/69544a8f3c11bd825651?protocol=7&client=js&version=8.4.0&flash=false";
+// Kick: chave atual com fallback para a chave pública anterior.
+const KICK_PUSHER_KEYS = ["34bf7a0ff419a2a775b9", "32cbd69e4b950bf97679"];
+const KICK_CHANNEL_SLUG = process.env.KICK_CHANNEL_SLUG || "carolinaporto";
 const PORT = process.env.PORT || 3000;
 
 let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
 let cinefyWs = null;
+let kickWs = null;
+let kickReconnectTimer = null;
+let kickKeyIndex = 0;
+let kickChatroomId = null;
 // Evita que mensagens simultâneas do mesmo usuário criem votos duplicados.
 const pendingRatingKeys = new Set();
 
@@ -255,6 +262,109 @@ function connectCinefy() {
   cinefyWs.on("error", (err) => console.error("[Cinefy erro]", err.message));
 }
 
+
+async function resolveKickChatroomId() {
+  // Tenta as duas rotas públicas usadas pela Kick; a resposta pode variar.
+  for (const url of [
+    `https://kick.com/api/v2/channels/${encodeURIComponent(KICK_CHANNEL_SLUG)}`,
+    `https://kick.com/api/v1/channels/${encodeURIComponent(KICK_CHANNEL_SLUG)}`
+  ]) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+      if (!res.ok) continue;
+      const body = await res.json();
+      const id = body?.chatroom?.id || body?.data?.chatroom?.id || body?.channel?.chatroom?.id;
+      if (id) return String(id);
+    } catch (e) {
+      console.error("[Kick] Falha ao resolver chatroom:", e.message);
+    }
+  }
+  return null;
+}
+
+function connectKick() {
+  if (kickWs) {
+    try { kickWs.removeAllListeners(); kickWs.terminate(); } catch (e) {}
+    kickWs = null;
+  }
+  if (kickReconnectTimer) clearTimeout(kickReconnectTimer);
+
+  (async () => {
+    if (!kickChatroomId) kickChatroomId = await resolveKickChatroomId();
+    if (!kickChatroomId) {
+      console.error(`[Kick] Não consegui obter o chatroom ID de ${KICK_CHANNEL_SLUG}. Verifique se a API da Kick está acessível.`);
+      kickReconnectTimer = setTimeout(connectKick, 10000);
+      return;
+    }
+
+    const key = KICK_PUSHER_KEYS[kickKeyIndex];
+    const url = `wss://ws-us2.pusher.com/app/${key}?protocol=7&client=js&version=8.4.0&flash=false`;
+    console.log(`[Kick] Conectando ao chat ${KICK_CHANNEL_SLUG} (chave ${kickKeyIndex + 1}/${KICK_PUSHER_KEYS.length})...`);
+    const ws = new WebSocket(url);
+    kickWs = ws;
+    let subscribed = false;
+
+    ws.on("open", () => console.log("[Kick] WebSocket aberto; aguardando Pusher"));
+    ws.on("message", async (raw) => {
+      try {
+        const packet = JSON.parse(raw.toString());
+        if (packet.event === "pusher:connection_established") {
+          ws.send(JSON.stringify({ event: "pusher:subscribe", data: { auth: "", channel: `chatrooms.${kickChatroomId}.v2` } }));
+          subscribed = true;
+          console.log("[Kick] Inscrição enviada para chatrooms." + kickChatroomId + ".v2");
+          return;
+        }
+        if (packet.event === "pusher:ping") {
+          ws.send(JSON.stringify({ event: "pusher:pong", data: {} }));
+          return;
+        }
+        if (packet.event === "pusher:subscription_error") {
+          console.error("[Kick] Inscrição recusada; tentando chave alternativa.");
+          kickKeyIndex = (kickKeyIndex + 1) % KICK_PUSHER_KEYS.length;
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+        if (packet.event !== "App\\Events\\ChatMessageEvent" && packet.event !== "App\\Events\\ChatMessageSentEvent") return;
+        let data = packet.data;
+        if (typeof data === "string") {
+          try { data = JSON.parse(data); } catch (e) { return; }
+        }
+        const text = String(data?.content || data?.message || data?.text || "").trim();
+        const sender = data?.sender || data?.user || {};
+        const username = String(sender.username || sender.slug || sender.name || sender.identity?.username || "").trim().toLowerCase();
+        const displayName = String(sender.username || sender.name || sender.identity?.username || username).trim();
+        let avatar = sender.profile_picture || sender.profile_pic || sender.avatar || sender.identity?.avatar || null;
+        if (avatar && typeof avatar === "object") avatar = avatar.url || avatar.src || null;
+        if (!text || !username) return;
+
+        const lower = text.toLowerCase();
+        let score = null;
+        if (/^\d+(\.\d+)?$/.test(lower)) score = parseFloat(lower);
+        else {
+          const match = lower.match(/^!(?:nota|n)\s*(\d+(?:\.\d+)?)$/);
+          if (match) score = parseFloat(match[1]);
+        }
+        if (score !== null && score >= 0 && score <= 10) {
+          console.log("[Kick MSG]", displayName + ":", text);
+          await addRating(username, displayName, score, avatar, "kick");
+        }
+      } catch (e) {
+        console.error("[Kick parse]", e.message);
+      }
+    });
+    ws.on("close", () => {
+      if (kickWs !== ws) return;
+      console.log("[Kick] Conexão fechada; reconectando em 5s...");
+      if (!subscribed) kickKeyIndex = (kickKeyIndex + 1) % KICK_PUSHER_KEYS.length;
+      kickReconnectTimer = setTimeout(connectKick, 5000);
+    });
+    ws.on("error", (err) => console.error("[Kick erro]", err.message));
+  })().catch((e) => {
+    console.error("[Kick] Erro de conexão:", e.message);
+    kickReconnectTimer = setTimeout(connectKick, 10000);
+  });
+}
+
 app.post("/movie-ended", async (req, res) => {
   const title = req.body.title;
   if (!title) return res.status(400).json({ error: "title obrigatório" });
@@ -280,7 +390,7 @@ app.post("/reset", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/", (req, res) => res.send("Backend + Cinefy online"));
+app.get("/", (req, res) => res.send("Backend + Cinefy + Kick online"));
 
 app.get("/search", async (req, res) => {
   const q = req.query.q, type = req.query.type || "movie", year = req.query.year || "";
@@ -466,4 +576,5 @@ app.get("/painel", (req, res) => {
 server.listen(PORT, () => {
   console.log("Backend online porta", PORT);
   connectCinefy();
+  connectKick();
 });
