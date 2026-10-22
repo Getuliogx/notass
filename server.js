@@ -22,6 +22,8 @@ let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
 let cinefyWs = null;
+// Evita que mensagens simultâneas do mesmo usuário criem votos duplicados.
+const pendingRatingKeys = new Set();
 
 async function getTwitchToken() {
   if (twitchToken && Date.now() < tokenExpires) return twitchToken;
@@ -84,49 +86,91 @@ function makeFallbackAvatar(name) {
   return "https://ui-avatars.com/api/?name=" + encodeURIComponent(name || "?") + "&background=8b5cf6&color=fff&size=128&bold=true&rounded=true";
 }
 
+function normalizeRatingKey(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 async function addRating(username, displayName, score, avatar, platform) {
   if (!currentMovie) {
     console.log("[IGNORADO] Nenhum filme ativo");
     return;
   }
 
-  const userKey = (username || "").toLowerCase().trim();
-  const nameKey = (displayName || username || "").toLowerCase().trim();
+  const userKey = normalizeRatingKey(username);
+  const nameKey = normalizeRatingKey(displayName || username);
+  const keys = [userKey, nameKey].filter(Boolean);
 
-  // Bloqueia duplicata por username OU displayName
-  const already = currentMovie.ratings.some(r => {
-    const ru = (r.username || "").toLowerCase().trim();
-    const rd = (r.displayName || r.username || "").toLowerCase().trim();
-    return (userKey && ru === userKey) || (nameKey && rd === nameKey);
+  // Também limpa duplicatas que já possam estar no estado atual.
+  const seenUsers = new Set();
+  currentMovie.ratings = currentMovie.ratings.filter(r => {
+    const ru = normalizeRatingKey(r.username);
+    const rd = normalizeRatingKey(r.displayName || r.username);
+    const identity = ru || rd;
+    if ((ru && seenUsers.has("u:" + ru)) || (rd && seenUsers.has("d:" + rd)) || (identity && seenUsers.has("i:" + identity))) {
+      return false;
+    }
+    if (ru) seenUsers.add("u:" + ru);
+    if (rd) seenUsers.add("d:" + rd);
+    if (identity) seenUsers.add("i:" + identity);
+    return true;
   });
 
-  if (already) {
-    console.log("[IGNORADO] Já votou:", displayName || username);
+  const already = currentMovie.ratings.some(r => {
+    const ru = normalizeRatingKey(r.username);
+    const rd = normalizeRatingKey(r.displayName || r.username);
+    return (userKey && (ru === userKey || rd === userKey)) ||
+           (nameKey && (ru === nameKey || rd === nameKey));
+  });
+
+  // Reserva as identidades antes de qualquer await para bloquear mensagens simultâneas.
+  if (already || keys.some(key => pendingRatingKeys.has(key))) {
+    console.log("[IGNORADO] Voto duplicado:", displayName || username);
     return;
   }
+  keys.forEach(key => pendingRatingKeys.add(key));
 
-  let finalAvatar = avatar;
-  if (finalAvatar && typeof finalAvatar === "string" && finalAvatar.startsWith("http")) {
-    // ok
-  } else if (platform === "twitch" || platform === "kick") {
-    finalAvatar = await getTwitchAvatar(username);
+  try {
+    let finalAvatar = avatar;
+    if (!(typeof finalAvatar === "string" && finalAvatar.startsWith("http")) &&
+        (platform === "twitch" || platform === "kick")) {
+      finalAvatar = await getTwitchAvatar(username);
+    }
+    if (!(typeof finalAvatar === "string" && finalAvatar.startsWith("http"))) {
+      finalAvatar = makeFallbackAvatar(displayName || username);
+    }
+
+    // Reconfere após a busca de avatar, pois o estado pode ter mudado durante o await.
+    const duplicateAfterWait = currentMovie.ratings.some(r => {
+      const ru = normalizeRatingKey(r.username);
+      const rd = normalizeRatingKey(r.displayName || r.username);
+      return (userKey && (ru === userKey || rd === userKey)) ||
+             (nameKey && (ru === nameKey || rd === nameKey));
+    });
+    if (duplicateAfterWait) {
+      console.log("[IGNORADO] Voto duplicado após espera:", displayName || username);
+      return;
+    }
+
+    currentMovie.ratings.push({
+      username,
+      displayName: displayName || username,
+      avatar: finalAvatar,
+      score: Number(score),
+      platform: platform || "unknown",
+      time: Date.now()
+    });
+
+    currentMovie.ratings.sort((a, b) => b.score - a.score);
+    broadcast({ type: "state", movie: currentMovie });
+    console.log("[NOTA OK]", platform, "|", displayName, "→", score);
+  } finally {
+    keys.forEach(key => pendingRatingKeys.delete(key));
   }
-  if (!finalAvatar || !finalAvatar.startsWith("http")) {
-    finalAvatar = makeFallbackAvatar(displayName || username);
-  }
-
-  currentMovie.ratings.push({
-    username,
-    displayName: displayName || username,
-    avatar: finalAvatar,
-    score: Number(score),
-    platform: platform || "unknown",
-    time: Date.now()
-  });
-
-  currentMovie.ratings.sort((a, b) => b.score - a.score);
-  broadcast({ type: "state", movie: currentMovie });
-  console.log("[NOTA OK]", platform, "|", displayName, "→", score);
 }
 
 wss.on("connection", (ws) => {
