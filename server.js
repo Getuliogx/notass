@@ -89,8 +89,19 @@ async function addRating(username, displayName, score, avatar, platform) {
     console.log("[IGNORADO] Nenhum filme ativo");
     return;
   }
-  if (currentMovie.ratings.some(r => r.username.toLowerCase() === username.toLowerCase())) {
-    console.log("[IGNORADO] Já votou:", username);
+
+  const userKey = (username || "").toLowerCase().trim();
+  const nameKey = (displayName || username || "").toLowerCase().trim();
+
+  // Bloqueia duplicata por username OU displayName
+  const already = currentMovie.ratings.some(r => {
+    const ru = (r.username || "").toLowerCase().trim();
+    const rd = (r.displayName || r.username || "").toLowerCase().trim();
+    return (userKey && ru === userKey) || (nameKey && rd === nameKey);
+  });
+
+  if (already) {
+    console.log("[IGNORADO] Já votou:", displayName || username);
     return;
   }
 
