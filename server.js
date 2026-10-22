@@ -144,7 +144,7 @@ async function addRating(username, displayName, score, avatar, platform) {
   try {
     let finalAvatar = avatar;
     if (!(typeof finalAvatar === "string" && finalAvatar.startsWith("http")) &&
-        (platform === "twitch" || platform === "kick")) {
+        platform === "twitch") {
       finalAvatar = await getTwitchAvatar(username);
     }
     if (!(typeof finalAvatar === "string" && finalAvatar.startsWith("http"))) {
@@ -264,77 +264,178 @@ function connectCinefy() {
 
 
 async function resolveKickChatroomId() {
-  // Tenta as duas rotas públicas usadas pela Kick; a resposta pode variar.
-  for (const url of [
-    `https://kick.com/api/v2/channels/${encodeURIComponent(KICK_CHANNEL_SLUG)}`,
-    `https://kick.com/api/v1/channels/${encodeURIComponent(KICK_CHANNEL_SLUG)}`
-  ]) {
+  // A Kick mudou os formatos de resposta ao longo do tempo; tentamos primeiro
+  // os endpoints diretos e depois proxies HTTP como fallback para bloqueios do servidor.
+  const slug = encodeURIComponent(KICK_CHANNEL_SLUG);
+  const directUrls = [
+    `https://kick.com/api/v2/channels/${slug}/chatroom`,
+    `https://kick.com/api/v2/channels/${slug}`,
+    `https://kick.com/api/v1/channels/${slug}`
+  ];
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": `https://kick.com/${KICK_CHANNEL_SLUG}`,
+    "Origin": "https://kick.com"
+  };
+  const findId = (body) => {
+    const candidates = [
+      body?.chatroom?.id,
+      body?.data?.chatroom?.id,
+      body?.channel?.chatroom?.id,
+      body?.data?.id,
+      body?.id
+    ];
+    const value = candidates.find(v => v !== undefined && v !== null && String(v).trim() !== "");
+    return value ? String(value) : null;
+  };
+
+  for (const url of directUrls) {
     try {
-      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+      const res = await fetch(url, { headers, timeout: 8000 });
+      if (!res.ok) {
+        console.warn(`[Kick] Endpoint ${new URL(url).pathname} respondeu HTTP ${res.status}`);
+        continue;
+      }
+      const body = await res.json();
+      const id = findId(body);
+      if (id) {
+        console.log(`[Kick] Chatroom ID resolvido: ${id}`);
+        return id;
+      }
+    } catch (e) {
+      console.warn("[Kick] Consulta direta falhou:", e.message);
+    }
+  }
+
+  const proxyUrls = [
+    `https://corsproxy.io/?url=${encodeURIComponent(directUrls[1])}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(directUrls[1])}`
+  ];
+  for (const url of proxyUrls) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": headers["User-Agent"], "Accept": "application/json" }, timeout: 10000 });
       if (!res.ok) continue;
       const body = await res.json();
-      const id = body?.chatroom?.id || body?.data?.chatroom?.id || body?.channel?.chatroom?.id;
-      if (id) return String(id);
+      const id = findId(body);
+      if (id) {
+        console.log(`[Kick] Chatroom ID resolvido via fallback: ${id}`);
+        return id;
+      }
     } catch (e) {
-      console.error("[Kick] Falha ao resolver chatroom:", e.message);
+      console.warn("[Kick] Fallback de consulta falhou:", e.message);
     }
   }
   return null;
 }
 
 function connectKick() {
+  if (kickReconnectTimer) {
+    clearTimeout(kickReconnectTimer);
+    kickReconnectTimer = null;
+  }
   if (kickWs) {
     try { kickWs.removeAllListeners(); kickWs.terminate(); } catch (e) {}
     kickWs = null;
   }
-  if (kickReconnectTimer) clearTimeout(kickReconnectTimer);
 
   (async () => {
     if (!kickChatroomId) kickChatroomId = await resolveKickChatroomId();
     if (!kickChatroomId) {
-      console.error(`[Kick] Não consegui obter o chatroom ID de ${KICK_CHANNEL_SLUG}. Verifique se a API da Kick está acessível.`);
-      kickReconnectTimer = setTimeout(connectKick, 10000);
+      console.error(`[Kick] Não consegui resolver o chatroom ID de ${KICK_CHANNEL_SLUG}. Vou tentar novamente em 15s.`);
+      kickReconnectTimer = setTimeout(connectKick, 15000);
       return;
     }
 
     const key = KICK_PUSHER_KEYS[kickKeyIndex];
     const url = `wss://ws-us2.pusher.com/app/${key}?protocol=7&client=js&version=8.4.0&flash=false`;
-    console.log(`[Kick] Conectando ao chat ${KICK_CHANNEL_SLUG} (chave ${kickKeyIndex + 1}/${KICK_PUSHER_KEYS.length})...`);
-    const ws = new WebSocket(url);
+    console.log(`[Kick] Conectando ao chat ${KICK_CHANNEL_SLUG} usando chave ${kickKeyIndex + 1}/${KICK_PUSHER_KEYS.length}...`);
+    const ws = new WebSocket(url, { handshakeTimeout: 10000 });
     kickWs = ws;
     let subscribed = false;
+    let subscribeSent = false;
+    let fallbackAttempted = false;
 
-    ws.on("open", () => console.log("[Kick] WebSocket aberto; aguardando Pusher"));
+    const scheduleReconnect = (delay = 5000) => {
+      if (kickWs !== ws) return;
+      kickWs = null;
+      if (kickReconnectTimer) clearTimeout(kickReconnectTimer);
+      kickReconnectTimer = setTimeout(connectKick, delay);
+    };
+
+    const tryFallbackKey = (reason) => {
+      if (fallbackAttempted) return false;
+      fallbackAttempted = true;
+      if (kickKeyIndex < KICK_PUSHER_KEYS.length - 1) {
+        kickKeyIndex += 1;
+        console.warn(`[Kick] ${reason}; tentando chave alternativa ${kickKeyIndex + 1}/${KICK_PUSHER_KEYS.length}.`);
+        if (kickWs === ws) kickWs = null;
+        try { ws.close(); } catch (e) {}
+        if (kickReconnectTimer) clearTimeout(kickReconnectTimer);
+        kickReconnectTimer = setTimeout(connectKick, 250);
+        return true;
+      }
+      return false;
+    };
+
+    ws.on("open", () => console.log("[Kick] WebSocket aberto; aguardando handshake Pusher."));
     ws.on("message", async (raw) => {
       try {
         const packet = JSON.parse(raw.toString());
-        if (packet.event === "pusher:connection_established") {
-          ws.send(JSON.stringify({ event: "pusher:subscribe", data: { auth: "", channel: `chatrooms.${kickChatroomId}.v2` } }));
-          subscribed = true;
-          console.log("[Kick] Inscrição enviada para chatrooms." + kickChatroomId + ".v2");
+        const event = String(packet.event || "");
+
+        if (event === "pusher:connection_established") {
+          if (!subscribeSent) {
+            ws.send(JSON.stringify({
+              event: "pusher:subscribe",
+              data: { auth: "", channel: `chatrooms.${kickChatroomId}.v2` }
+            }));
+            subscribeSent = true;
+            console.log("[Kick] Inscrição enviada para chatrooms." + kickChatroomId + ".v2");
+          }
           return;
         }
-        if (packet.event === "pusher:ping") {
+        if (event === "pusher:ping") {
           ws.send(JSON.stringify({ event: "pusher:pong", data: {} }));
           return;
         }
-        if (packet.event === "pusher:subscription_error") {
-          console.error("[Kick] Inscrição recusada; tentando chave alternativa.");
-          kickKeyIndex = (kickKeyIndex + 1) % KICK_PUSHER_KEYS.length;
-          try { ws.close(); } catch (e) {}
+        if (event === "pusher_internal:subscription_succeeded" || event === "pusher:subscription_succeeded") {
+          subscribed = true;
+          console.log("[Kick] CHAT CONECTADO: inscrição aceita; aguardando notas no chat.");
           return;
         }
-        if (packet.event !== "App\\Events\\ChatMessageEvent" && packet.event !== "App\\Events\\ChatMessageSentEvent") return;
+        if (event === "pusher:subscription_error" || event === "pusher:error") {
+          const detail = typeof packet.data === "string" ? packet.data : JSON.stringify(packet.data || {});
+          console.error("[Kick] Erro do Pusher:", detail);
+          if (!tryFallbackKey("Pusher recusou a conexão/inscrição")) scheduleReconnect(15000);
+          return;
+        }
+
+        if (event !== "App\\Events\\ChatMessageEvent" && event !== "App\\Events\\ChatMessageSentEvent") return;
         let data = packet.data;
         if (typeof data === "string") {
           try { data = JSON.parse(data); } catch (e) { return; }
         }
-        const text = String(data?.content || data?.message || data?.text || "").trim();
-        const sender = data?.sender || data?.user || {};
-        const username = String(sender.username || sender.slug || sender.name || sender.identity?.username || "").trim().toLowerCase();
-        const displayName = String(sender.username || sender.name || sender.identity?.username || username).trim();
-        let avatar = sender.profile_picture || sender.profile_pic || sender.avatar || sender.identity?.avatar || null;
-        if (avatar && typeof avatar === "object") avatar = avatar.url || avatar.src || null;
+        if (!data || typeof data !== "object") return;
+
+        // Kick tem enviado payloads em mais de um formato. O texto às vezes fica
+        // em data.content, outras vezes em data.message.message.
+        const nestedMessage = data.message && typeof data.message === "object" ? data.message : null;
+        const textValue = [
+          data.content,
+          data.text,
+          data.body,
+          nestedMessage?.content,
+          nestedMessage?.message,
+          nestedMessage?.text,
+          typeof data.message === "string" ? data.message : null
+        ].find(v => typeof v === "string" && v.trim());
+        const text = String(textValue || "").trim();
+        const sender = data.sender || data.user || data.author || nestedMessage?.sender || nestedMessage?.user || {};
+        const username = String(sender.username || sender.slug || sender.name || sender.login || sender.user_name || sender.identity?.username || "").trim().toLowerCase();
+        const displayName = String(sender.display_name || sender.displayName || sender.username || sender.name || sender.identity?.username || username).trim();
+        let avatar = sender.profile_picture || sender.profile_pic || sender.profilePicture || sender.avatar || sender.avatar_url || sender.identity?.avatar || null;
+        if (avatar && typeof avatar === "object") avatar = avatar.url || avatar.src || avatar.href || null;
         if (!text || !username) return;
 
         const lower = text.toLowerCase();
@@ -344,7 +445,7 @@ function connectKick() {
           const match = lower.match(/^!(?:nota|n)\s*(\d+(?:\.\d+)?)$/);
           if (match) score = parseFloat(match[1]);
         }
-        if (score !== null && score >= 0 && score <= 10) {
+        if (score !== null && Number.isFinite(score) && score >= 0 && score <= 10) {
           console.log("[Kick MSG]", displayName + ":", text);
           await addRating(username, displayName, score, avatar, "kick");
         }
@@ -352,15 +453,24 @@ function connectKick() {
         console.error("[Kick parse]", e.message);
       }
     });
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
       if (kickWs !== ws) return;
-      console.log("[Kick] Conexão fechada; reconectando em 5s...");
-      if (!subscribed) kickKeyIndex = (kickKeyIndex + 1) % KICK_PUSHER_KEYS.length;
-      kickReconnectTimer = setTimeout(connectKick, 5000);
+      console.warn(`[Kick] WebSocket fechou (${code}${reason?.length ? ", " + reason.toString() : ""}); reconectando.`);
+      if (!subscribed && !fallbackAttempted && kickKeyIndex < KICK_PUSHER_KEYS.length - 1) {
+        kickKeyIndex += 1;
+        console.warn(`[Kick] Tentando chave alternativa ${kickKeyIndex + 1}/${KICK_PUSHER_KEYS.length}.`);
+      } else if (subscribed) {
+        // Se a sessão já conectou, mantém a chave que funcionou.
+      } else {
+        kickKeyIndex = 0;
+      }
+      scheduleReconnect(5000);
     });
-    ws.on("error", (err) => console.error("[Kick erro]", err.message));
+    ws.on("error", (err) => {
+      console.error("[Kick erro]", err.message);
+    });
   })().catch((e) => {
-    console.error("[Kick] Erro de conexão:", e.message);
+    console.error("[Kick] Falha ao iniciar conexão:", e.message);
     kickReconnectTimer = setTimeout(connectKick, 10000);
   });
 }
