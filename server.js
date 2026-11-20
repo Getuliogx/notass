@@ -17,7 +17,6 @@ const RAWG_API_KEY = "76ba8a32afc241e7b3d0dc9acd4bb7b8";
 const TWITCH_CLIENT_ID = "sah4oubx3irkbvh6m4jf28s2mefx46";
 const TWITCH_CLIENT_SECRET = "k271wxor46h79d66wohz47v85mxdhg";
 const CINEFY_CHANNEL_ID = "d81e634a-3ab1-4217-bf35-94e8d3c5250a";
-const CINEFY_PUSHER_URL = "wss://ws-sa1.pusher.com/app/69544a8f3c11bd825651?protocol=7&client=js&version=8.4.0&flash=false";
 // Kick: chave atual com fallback para a chave pública anterior.
 const KICK_PUSHER_KEYS = ["34bf7a0ff419a2a775b9", "32cbd69e4b950bf97679"];
 const KICK_CHANNEL_SLUG = process.env.KICK_CHANNEL_SLUG || "carolinaporto";
@@ -26,7 +25,6 @@ const PORT = process.env.PORT || 3000;
 let currentMovie = null;
 let twitchToken = null;
 let tokenExpires = 0;
-let cinefyWs = null;
 let kickWs = null;
 let kickReconnectTimer = null;
 let kickKeyIndex = 0;
@@ -215,72 +213,83 @@ wss.on("connection", (ws) => {
   });
 });
 
-function connectCinefy() {
-  if (cinefyWs) try { cinefyWs.terminate(); } catch (e) {}
-  console.log("[Cinefy] Conectando...");
-  cinefyWs = new WebSocket(CINEFY_PUSHER_URL);
+// Cinefy: o chat não usa mais Pusher; as mensagens vêm de /v1/threads (consulta a cada 2s).
+let cinefyTimer = null;
+let cinefyFirstPoll = true;
+let cinefyLastError = "";
+let cinefySeen = new Set();
 
-  cinefyWs.on("open", () => {
-    console.log("[Cinefy] Conectado");
-    cinefyWs.send(JSON.stringify({
-      event: "pusher:subscribe",
-      data: { channel: "chatroom." + CINEFY_CHANNEL_ID }
-    }));
-  });
+async function handleCinefyThread(t) {
+  const text = String(t.content || "").trim();
+  if (!text) return;
+  const author = t.author || {};
+  const username = String(author.slug || author.username || "").trim().toLowerCase();
+  const displayName = String(author.displayName || author.username || username).trim();
+  if (!username) return;
 
-  cinefyWs.on("message", async (raw) => {
-    try {
-      const payload = JSON.parse(raw.toString());
-      const evt = payload.event || "";
-      if (evt === "pusher:pong" || evt === "pusher_internal:subscription_succeeded") return;
+  let avatar = null;
+  if (typeof author.avatar === "string" && author.avatar) {
+    avatar = author.avatar.startsWith("http") ? author.avatar : "https://cdn.cinefy.gg/avatars/" + encodeURIComponent(author.avatar);
+  }
 
-      let data = payload.data;
-      if (typeof data === "string") {
-        try { data = JSON.parse(data); } catch (e) { return; }
-      }
-      if (!data || typeof data !== "object") return;
+  const lower = text.toLowerCase();
+  let score = null;
+  if (/^\d+(\.\d+)?$/.test(lower)) score = parseFloat(lower);
+  else {
+    const m = lower.match(/^!(?:nota|n)\s*(\d+(?:\.\d+)?)$/);
+    if (m) score = parseFloat(m[1]);
+  }
 
-      const text = (data.content || data.message || data.text || data.body || data.msg || "").toString().trim();
-      if (!text) return;
+  if (score !== null && score >= 0 && score <= 10) {
+    console.log("[Cinefy MSG]", displayName + ":", text);
+    await addRating(username, displayName, score, avatar, "cinefy");
+  }
+}
 
-      const sender = data.sender || data.user || data.author || data.from || data.member || {};
-      const username = (sender.username || sender.slug || sender.name || sender.login || sender.user_name || data.username || "").toLowerCase();
-      const displayName = sender.username || sender.name || sender.display_name || sender.displayName || data.username || username;
+async function pollCinefy() {
+  try {
+    const url = "https://api.cinefy.gg/v1/threads?contextType=live&contextId=" + encodeURIComponent(CINEFY_CHANNEL_ID) + "&perPage=75";
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept": "application/json",
+        "Origin": "https://cinefy.gg",
+        "Referer": "https://cinefy.gg/"
+      },
+      timeout: 10000
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const body = await res.json();
+    const list = (Array.isArray(body) ? body : Array.isArray(body && body.data) ? body.data : [])
+      .filter(t => t && t.id)
+      .sort((a, b) => String(a.publishedAt || "").localeCompare(String(b.publishedAt || "")));
 
-      let avatar =
-        sender.profile_pic || sender.profile_picture || sender.profilePicture ||
-        sender.avatar || sender.avatar_url || sender.image || sender.photo || sender.picture ||
-        (sender.identity && (sender.identity.avatar || sender.identity.profile_pic)) || null;
+    if (cinefyLastError) { console.log("[Cinefy] Conexão restabelecida"); cinefyLastError = ""; }
 
-      if (avatar && typeof avatar === "object") {
-        avatar = avatar.url || avatar.src || avatar.href || null;
-      }
-
-      if (!username) return;
-
-      const lower = text.toLowerCase();
-      let score = null;
-      if (/^\d+(\.\d+)?$/.test(lower)) score = parseFloat(lower);
-      else {
-        const m = lower.match(/^!(?:nota|n)\s*(\d+(?:\.\d+)?)$/);
-        if (m) score = parseFloat(m[1]);
-      }
-
-      if (score !== null && score >= 0 && score <= 10) {
-        console.log("[Cinefy MSG]", displayName + ":", text);
-        await addRating(username, displayName, score, avatar, "cinefy");
-      }
-    } catch (e) {
-      console.error("[Cinefy parse]", e.message);
+    for (const t of list) {
+      if (cinefySeen.has(t.id)) continue;
+      cinefySeen.add(t.id);
+      if (cinefyFirstPoll) continue; // mensagens que já estavam no chat não contam como nota
+      try { await handleCinefyThread(t); } catch (e) { console.error("[Cinefy parse]", e.message); }
     }
-  });
+    if (cinefyFirstPoll) {
+      cinefyFirstPoll = false;
+      console.log("[Cinefy] CHAT CONECTADO: lendo mensagens novas (" + list.length + " antigas ignoradas).");
+    }
+    if (cinefySeen.size > 2000) cinefySeen = new Set(Array.from(cinefySeen).slice(-500));
+  } catch (e) {
+    if (e.message !== cinefyLastError) {
+      console.error("[Cinefy erro]", e.message);
+      cinefyLastError = e.message;
+    }
+  }
+  cinefyTimer = setTimeout(pollCinefy, 2000);
+}
 
-  cinefyWs.on("close", () => {
-    console.log("[Cinefy] Caiu. Reconectando em 5s...");
-    setTimeout(connectCinefy, 5000);
-  });
-
-  cinefyWs.on("error", (err) => console.error("[Cinefy erro]", err.message));
+function connectCinefy() {
+  if (cinefyTimer) clearTimeout(cinefyTimer);
+  console.log("[Cinefy] Iniciando leitura do chat...");
+  pollCinefy();
 }
 
 
