@@ -12,6 +12,8 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const TMDB_API_KEY = "b095ccbbb185d27703d007ae0ded5f7d";
+// RAWG API key fornecida pelo usuário para pesquisa de jogos.
+const RAWG_API_KEY = "76ba8a32afc241e7b3d0dc9acd4bb7b8";
 const TWITCH_CLIENT_ID = "sah4oubx3irkbvh6m4jf28s2mefx46";
 const TWITCH_CLIENT_SECRET = "k271wxor46h79d66wohz47v85mxdhg";
 const CINEFY_CHANNEL_ID = "d81e634a-3ab1-4217-bf35-94e8d3c5250a";
@@ -80,6 +82,25 @@ async function searchMovie(title) {
     }
   } catch (err) {}
   return { title, year: null, poster: null };
+}
+
+async function searchGames(query, year = "") {
+  try {
+    let url = "https://api.rawg.io/api/games?key=" + RAWG_API_KEY + "&search=" + encodeURIComponent(query) + "&page_size=16";
+    if (year) url += "&dates=" + year + "-01-01," + year + "-12-31";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("RAWG HTTP " + res.status);
+    const data = await res.json();
+    return (data.results || []).map(game => ({
+      title: game.name,
+      year: (game.released || "").substring(0, 4) || null,
+      poster: game.background_image || null,
+      type: "game"
+    }));
+  } catch (e) {
+    console.error("[RAWG pesquisa]", e.message);
+    return [];
+  }
 }
 
 function broadcast(data) {
@@ -475,6 +496,23 @@ function connectKick() {
   });
 }
 
+app.post("/game-ended", (req, res) => {
+  const title = req.body.title;
+  if (!title) return res.status(400).json({ error: "title obrigatório" });
+  const game = {
+    title,
+    year: req.body.year || null,
+    poster: req.body.poster || null,
+    ratings: [],
+    startedAt: Date.now(),
+    mediaType: "game"
+  };
+  currentMovie = game;
+  broadcast({ type: "movie-started", movie: currentMovie });
+  console.log(">>> Jogo:", title);
+  res.json({ ok: true, movie: currentMovie });
+});
+
 app.post("/movie-ended", async (req, res) => {
   const title = req.body.title;
   if (!title) return res.status(400).json({ error: "title obrigatório" });
@@ -505,6 +543,7 @@ app.get("/", (req, res) => res.send("Backend + Cinefy + Kick online"));
 app.get("/search", async (req, res) => {
   const q = req.query.q, type = req.query.type || "movie", year = req.query.year || "";
   if (!q) return res.json([]);
+  if (type === "game") return res.json(await searchGames(q, year));
   try {
     let url = "https://api.themoviedb.org/3/search/" + type + "?api_key=" + TMDB_API_KEY + "&query=" + encodeURIComponent(q) + "&language=pt-BR";
     if (year) url += "&year=" + year;
@@ -597,11 +636,12 @@ app.get("/painel", (req, res) => {
 
     <!-- Pesquisa -->
     <div class="card-box">
-      <h2>Pesquisar filme ou série</h2>
+      <h2>Pesquisar filme, série ou jogo</h2>
       <div class="search-row">
         <select id="type">
           <option value="movie">Filme</option>
           <option value="tv">Série</option>
+          <option value="game">Jogo</option>
         </select>
         <input type="text" id="q" placeholder="Digite o nome..." autofocus>
         <input type="text" id="year" placeholder="Ano" style="width:90px;flex:0">
@@ -627,7 +667,7 @@ app.get("/painel", (req, res) => {
           '<img src="' + (item.poster || 'https://via.placeholder.com/150x210/161b22/555?text=Sem') + '">' +
           '<div class="info">' +
             '<div class="title">' + item.title + '</div>' +
-            '<div class="meta">' + (item.type === "tv" ? "Série" : "Filme") + (item.year ? " • " + item.year : "") + '</div>' +
+            '<div class="meta">' + (item.type === "tv" ? "Série" : (item.type === "game" ? "Jogo" : "Filme")) + (item.year ? " • " + item.year : "") + '</div>' +
           '</div></div>';
       }).join("") || '<div class="empty">Nenhum resultado.</div>';
     }
@@ -635,10 +675,12 @@ app.get("/painel", (req, res) => {
     async function activate(item) {
       document.getElementById("status").textContent = "Ativando: " + item.title + "...";
       const title = item.title + (item.year ? " (" + item.year + ")" : "");
-      const res = await fetch("/movie-ended", {
+      const endpoint = item.type === "game" ? "/game-ended" : "/movie-ended";
+      const payload = item.type === "game" ? { title: item.title, year: item.year, poster: item.poster } : { title: title };
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title })
+        body: JSON.stringify(payload)
       });
       if (res.ok) {
         document.getElementById("status").textContent = "✓ Ativado: " + item.title;
