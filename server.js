@@ -82,6 +82,24 @@ async function searchMovie(title) {
   return { title, year: null, poster: null };
 }
 
+async function getTitleById(id, type) {
+  try {
+    const t = type === "tv" ? "tv" : "movie";
+    const url = "https://api.themoviedb.org/3/" + t + "/" + encodeURIComponent(id) + "?api_key=" + TMDB_API_KEY + "&language=pt-BR";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("TMDB HTTP " + res.status);
+    const item = await res.json();
+    return {
+      title: item.title || item.name,
+      year: (item.release_date || item.first_air_date || "").substring(0, 4),
+      poster: item.poster_path ? "https://image.tmdb.org/t/p/w500" + item.poster_path : null
+    };
+  } catch (err) {
+    console.error("[TMDB por ID]", err.message);
+    return null;
+  }
+}
+
 async function searchGames(query, year = "") {
   try {
     let url = "https://api.rawg.io/api/games?key=" + RAWG_API_KEY + "&search=" + encodeURIComponent(query) + "&page_size=16";
@@ -523,10 +541,12 @@ app.post("/game-ended", (req, res) => {
 });
 
 app.post("/movie-ended", async (req, res) => {
-  const title = req.body.title;
-  if (!title) return res.status(400).json({ error: "title obrigatório" });
-  console.log(">>> Filme:", title);
-  const tmdb = await searchMovie(title);
+  const { title, id, type } = req.body;
+  if (!title && !id) return res.status(400).json({ error: "title ou id obrigatório" });
+  console.log(">>> Filme/Série:", title || id, id ? "(tmdb id " + id + ", " + type + ")" : "");
+  // Com ID, busca exatamente o título escolhido; sem ID, cai na busca por nome (comportamento antigo).
+  let tmdb = id ? await getTitleById(id, type) : null;
+  if (!tmdb) tmdb = await searchMovie(title);
   currentMovie = {
     title: tmdb.title,
     year: tmdb.year,
@@ -559,6 +579,7 @@ app.get("/search", async (req, res) => {
     const r = await fetch(url);
     const data = await r.json();
     res.json((data.results || []).slice(0, 16).map(i => ({
+      id: i.id,
       title: i.title || i.name,
       year: (i.release_date || i.first_air_date || "").substring(0, 4) || null,
       poster: i.poster_path ? "https://image.tmdb.org/t/p/w300" + i.poster_path : null,
@@ -685,7 +706,7 @@ app.get("/painel", (req, res) => {
       document.getElementById("status").textContent = "Ativando: " + item.title + "...";
       const title = item.title + (item.year ? " (" + item.year + ")" : "");
       const endpoint = item.type === "game" ? "/game-ended" : "/movie-ended";
-      const payload = item.type === "game" ? { title: item.title, year: item.year, poster: item.poster } : { title: title };
+      const payload = item.type === "game" ? { title: item.title, year: item.year, poster: item.poster } : { title: title, id: item.id, type: item.type };
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
