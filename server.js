@@ -75,11 +75,18 @@ async function searchMovie(title) {
       return {
         title: item.title || item.name,
         year: (item.release_date || item.first_air_date || "").substring(0, 4),
-        poster: item.poster_path ? "https://image.tmdb.org/t/p/w500" + item.poster_path : null
+        poster: item.poster_path ? "https://image.tmdb.org/t/p/w500" + item.poster_path : null,
+        mediaType: item.media_type
       };
     }
   } catch (err) {}
-  return { title, year: null, poster: null };
+  return { title, year: null, poster: null, mediaType: null };
+}
+
+function applyEpisodeTitle(movie) {
+  if (movie.mediaType === "tv") {
+    movie.title = movie.baseTitle + " EP" + movie.episode + " - T" + movie.season;
+  }
 }
 
 async function getTitleById(id, type) {
@@ -92,7 +99,8 @@ async function getTitleById(id, type) {
     return {
       title: item.title || item.name,
       year: (item.release_date || item.first_air_date || "").substring(0, 4),
-      poster: item.poster_path ? "https://image.tmdb.org/t/p/w500" + item.poster_path : null
+      poster: item.poster_path ? "https://image.tmdb.org/t/p/w500" + item.poster_path : null,
+      mediaType: t
     };
   } catch (err) {
     console.error("[TMDB por ID]", err.message);
@@ -549,12 +557,35 @@ app.post("/movie-ended", async (req, res) => {
   if (!tmdb) tmdb = await searchMovie(title);
   currentMovie = {
     title: tmdb.title,
+    baseTitle: tmdb.title,
     year: tmdb.year,
     poster: tmdb.poster,
+    mediaType: (type || tmdb.mediaType) === "tv" ? "tv" : "movie",
+    season: 1,
+    episode: 1,
     ratings: [],
     startedAt: Date.now()
   };
+  applyEpisodeTitle(currentMovie);
   broadcast({ type: "movie-started", movie: currentMovie });
+  res.json({ ok: true, movie: currentMovie });
+});
+
+// Troca episódio/temporada da série ativa e atualiza a overlay na hora (mantém as notas).
+app.post("/episode", (req, res) => {
+  if (!currentMovie || currentMovie.mediaType !== "tv") {
+    return res.status(400).json({ error: "Nenhuma série ativa" });
+  }
+  const season = parseInt(req.body.season, 10);
+  const episode = parseInt(req.body.episode, 10);
+  if (!(season >= 1) || !(episode >= 1) || season > 999 || episode > 9999) {
+    return res.status(400).json({ error: "Temporada/episódio inválidos" });
+  }
+  currentMovie.season = season;
+  currentMovie.episode = episode;
+  applyEpisodeTitle(currentMovie);
+  broadcast({ type: "state", movie: currentMovie });
+  console.log(">>> Episódio:", currentMovie.title);
   res.json({ ok: true, movie: currentMovie });
 });
 
@@ -636,6 +667,15 @@ app.get("/painel", (req, res) => {
     .empty { color: #8b949e; font-size: 14px; }
     .status { margin-top: 12px; font-size: 13px; color: #3fb950; }
     .actions { display: flex; gap: 8px; margin-top: 10px; }
+    #ep-box { display: none; border-top: 1px solid #21262d; margin-top: 16px; padding-top: 16px; }
+    #ep-box .ep-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
+    .ep-row { display: flex; gap: 18px; flex-wrap: wrap; }
+    .ep-field label { display: block; font-size: 11px; letter-spacing: 0.08em; color: #8b949e; font-weight: 700; margin-bottom: 6px; }
+    .stepper { display: flex; gap: 6px; align-items: center; }
+    .stepper input { flex: none; width: 76px; min-width: 0; text-align: center; font-size: 16px; font-weight: 600; -moz-appearance: textfield; }
+    .stepper input::-webkit-outer-spin-button, .stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .step-btn { width: 40px; height: 40px; border-radius: 8px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; font-size: 14px; }
+    .step-btn:hover { background: #30363d; border-color: #8b5cf6; }
   </style>
 </head>
 <body>
@@ -662,6 +702,27 @@ app.get("/painel", (req, res) => {
         </div>
       </div>
       <div id="current" class="empty">Nenhum título ativo.</div>
+      <div id="ep-box">
+        <div class="ep-title">Episódio e temporada — atualiza automaticamente</div>
+        <div class="ep-row">
+          <div class="ep-field">
+            <label>EPISÓDIO</label>
+            <div class="stepper">
+              <button class="step-btn" onclick="stepEp('ep-episode', -1)">▼</button>
+              <input type="number" id="ep-episode" min="1" value="1" oninput="sendEpisodeSoon()">
+              <button class="step-btn" onclick="stepEp('ep-episode', 1)">▲</button>
+            </div>
+          </div>
+          <div class="ep-field">
+            <label>TEMPORADA</label>
+            <div class="stepper">
+              <button class="step-btn" onclick="stepEp('ep-season', -1)">▼</button>
+              <input type="number" id="ep-season" min="1" value="1" oninput="sendEpisodeSoon()">
+              <button class="step-btn" onclick="stepEp('ep-season', 1)">▲</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Pesquisa -->
@@ -720,9 +781,49 @@ app.get("/painel", (req, res) => {
       }
     }
 
+    var epTimer = null;
+    function updateEpBox(data) {
+      var box = document.getElementById("ep-box");
+      if (data && data.mediaType === "tv") {
+        box.style.display = "block";
+        var ae = document.activeElement ? document.activeElement.id : "";
+        if (ae !== "ep-episode") document.getElementById("ep-episode").value = data.episode || 1;
+        if (ae !== "ep-season") document.getElementById("ep-season").value = data.season || 1;
+      } else {
+        box.style.display = "none";
+      }
+    }
+    function stepEp(id, delta) {
+      var el = document.getElementById(id);
+      el.value = Math.max(1, (parseInt(el.value, 10) || 1) + delta);
+      sendEpisode();
+    }
+    function sendEpisodeSoon() {
+      clearTimeout(epTimer);
+      epTimer = setTimeout(sendEpisode, 400);
+    }
+    async function sendEpisode() {
+      clearTimeout(epTimer);
+      var episode = parseInt(document.getElementById("ep-episode").value, 10);
+      var season = parseInt(document.getElementById("ep-season").value, 10);
+      if (!(episode >= 1) || !(season >= 1)) return;
+      var res = await fetch("/episode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ season: season, episode: episode })
+      });
+      if (res.ok) {
+        document.getElementById("status").textContent = "✓ Overlay atualizada: EP" + episode + " - T" + season;
+        refreshState();
+      } else {
+        document.getElementById("status").textContent = "Erro ao atualizar episódio";
+      }
+    }
+
     async function refreshState() {
       const res = await fetch("/state");
       const data = await res.json();
+      updateEpBox(data);
       const el = document.getElementById("current");
       if (data && data.title) {
         el.innerHTML =
